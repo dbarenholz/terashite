@@ -1,57 +1,78 @@
-use std::{collections::HashMap, io::Read, time::Duration};
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+use std::time::Instant;
+use tokio::sync::Mutex;
 
-use reqwest::{Client, redirect::Policy};
-use scraper::Html;
-use tokio::{sync::Mutex, time::sleep};
-
-use crate::cache;
-
-#[derive(Hash, Eq, PartialEq, Debug, Clone)]
-pub(crate) enum Domain {
-    Tibisukemaru,
-    BachelorSeal,
+/// A wrapper around a reqwest client with `DDoS` protection.
+///
+/// Protection is simple: only allow 1 request per domain every 10 seconds.
+pub struct HTMLDownloader<'a> {
+    client: &'a reqwest::Client,
+    request_times: Arc<Mutex<HashMap<String, Instant>>>,
 }
 
-pub struct HTMLDownloader {
-    client: Client,
-    download_lock: Mutex<()>,
-}
-
-impl HTMLDownloader {
-    pub(crate) fn new() -> Self {
-        let user_agent_str =
-            "Mozilla/5.0 (X11; Linux x86_64; rv:148.0) Gecko/20100101 Firefox/148.0";
-        let client = reqwest::Client::builder()
-            .user_agent(user_agent_str)
-            .redirect(Policy::none())
-            .build()
-            // .map_err(|e| format!("could not create client: {e}"))
-            .expect("creating client");
-
+impl<'a> From<&'a reqwest::Client> for HTMLDownloader<'a> {
+    fn from(client: &'a reqwest::Client) -> Self {
         Self {
             client,
-            download_lock: Mutex::new(()),
+            request_times: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+}
+
+impl HTMLDownloader<'_> {
+    /// Extract the domain from a URL string.
+    fn extract_domain(url: &str) -> Result<String, String> {
+        // Remove the scheme
+        let url_without_scheme = url
+            .strip_prefix("https://")
+            .or_else(|| url.strip_prefix("http://"))
+            .unwrap_or(url);
+
+        // Get the part before the first '/' or ':'
+        let domain = url_without_scheme
+            .split('/')
+            .next()
+            .and_then(|part| part.split(':').next())
+            .ok_or_else(|| format!("could not parse domain from '{url}'"))?;
+
+        if domain.is_empty() {
+            Err(format!("could not parse domain from '{url}'"))
+        } else {
+            Ok(domain.to_string())
         }
     }
 
-    pub(crate) async fn fetch_url(&self, url: &str) -> Result<Html, String> {
-        if let Ok(mut f) = cache::try_get_file(url) {
-            let mut txt = String::new();
-            f.read_to_string(&mut txt)
-                .map_err(|e| format!("could not read file '{f:?}': {e}"))?;
-            return Ok(scraper::Html::parse_document(&txt));
+    /// Gets the HTML for some URL by downloading it.
+    /// Does not involve the cache in any way, and does not do any checks or parsing.
+    ///
+    /// Enforces rate limiting: maximum 1 request per domain every 10 seconds.
+    /// If a request is attempted before the 10-second interval has passed, this function
+    /// will sleep until the interval is satisfied.
+    ///
+    /// # Errors
+    /// Returns an error if the URL cannot be fetched, if the status code is not success,
+    /// or if the domain cannot be parsed.
+    pub(crate) async fn download(&self, url: &str) -> Result<String, String> {
+        let domain = Self::extract_domain(url)?;
+
+        // Rate limiting: ensure 10 seconds between requests per domain
+        {
+            let mut times = self.request_times.lock().await;
+            if let Some(last_request) = times.get(&domain) {
+                let elapsed = last_request.elapsed();
+                if elapsed < Duration::from_secs(10) {
+                    let wait_time = Duration::from_secs(10) - elapsed;
+                    drop(times); // Release the lock before sleeping
+                    tokio::time::sleep(wait_time).await;
+                    times = self.request_times.lock().await;
+                }
+            }
+            times.insert(domain.clone(), Instant::now());
         }
 
-        // Not cached, go download; sleep afterwards for 10s within mutex to keep server happy
-        let _guard = self.download_lock.lock().await;
-        let txt = self.download_url(url).await?;
-        cache::save_html(url, &txt)?;
-        sleep(Duration::from_secs(10)).await;
-        Ok(scraper::Html::parse_document(&txt))
-    }
-
-    async fn download_url(&self, url: &str) -> Result<String, String> {
-        let result = match self.client.get(url).send().await {
+        match self.client.get(url).send().await {
             Ok(res) => {
                 let status = res.status();
                 if status.is_success() {
@@ -68,7 +89,26 @@ impl HTMLDownloader {
                 }
             }
             Err(e) => Err(format!("could not fetch '{url}' because {e}")),
-        };
-        result
+        }
     }
+}
+
+#[must_use]
+pub fn create_downloader(client: &reqwest::Client) -> HTMLDownloader<'_> {
+    HTMLDownloader::from(client)
+}
+
+/// Creates a reqwest client to use in the project.
+///
+/// # Panics
+/// Panics if the client cannot be built, which should never happen.
+#[must_use]
+pub fn create_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .user_agent("Mozilla/5.0 (X11; Linux x86_64; rv:148.0) Gecko/20100101 Firefox/148.0")
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(10))
+        .connect_timeout(Duration::from_secs(2))
+        .build()
+        .expect("creating client")
 }

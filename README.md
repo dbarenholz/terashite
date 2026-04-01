@@ -9,33 +9,53 @@ We have scrapers for the [bachelor_seal](http://blog.livedoor.jp/bachelor_seal-p
 
 ## Usage
 
-The scraper is a single binary with no options. It always scrapes all new puzzles from all implemented domains, and saves them to disk. We save the visited html files under `~/.terashite/html`, and resulting puzzles in `~/.terashite/puzzles`. When rerunning the scraper, if html files exist locally, they will be used instead of hammering the servers needlessly. If html files need to be fetched, we only send 1 request every 10 seconds (per domain) to avoid DoS-ing the servers.
+For specifics, see the `--help` output. Generally speaking, you can either specify directly:
+
+- puzzle urls (only works if we know how to handle it) using `-s/--single`
+- domains (only works if we have a scraper for it) using `-d/--domain`
+- or just scrape everything by running without any arguments
+
+It is probably useful to list the supported domains first, to know what you can scrape:
+
+```bash
+cargo run -- --list-domains
+```
+
+It is probably also useful to create a config file to specify where you want puzzles to be saved.
+When trying to read a config file, we look for `terashite.conf` in the XDG config directory (e.g. `~/.config/terashite/terashite.conf`), and if it doesn't exist, we look for `terashite.conf` in the home directory. If neither exists, we use the default config, which saves puzzles to `./terashite` (i.e. a `terashite` directory in the current working directory).
+
+A config file is exceedingly simple, and looks like this:
+
+```toml
+# This is a comment that will be ignored.
+out = "/path/to/save/puzzles"
+```
 
 ## Puzzle format
 
 Puzzles are saved using following naming scheme, where words in curlies are `{placeholders}`.
 
 ```raw
-~/.terashite/puzzles/{domain-id}-{difficulty}-{puzzle-id}.pzprc
+{out}/{domain-id}/{puzzle-no}-{difficulty}.pzprc
 ```
 
-They are plaintext files -- the extension is chosen as `pzpr` for the [pzpr format](#), with `c` for comments, similar to `jsonc` to `json`. Comments start with `#`.
+They are plaintext files -- the extension is chosen as `pzpr` for the [pzpr format](<https://github.com/robx/pzprjs/>), with `c` for comments, similar to `jsonc` to `json`. Comments start with `#`.
 
-```txt
-# scraped by terashite at {date}
-# source: {url}
-{width}
-{heigth}
-{pzpr-string}
+```raw
+# domain_name: {domain-name}
+# difficulty: {difficulty}
+# puzzle_no: {puzzle-no}
+# at: {date}
+# from_url: {url}
+{pzpr}
 ```
 
 | Placeholder | Explanation |
 | - | - |
-| `domain-id` | a short string identifying the domain the puzzle was scraped from |
+| `out` | the output directory specified in the config file, or `./terashite` if no config file is found |
+| `domain-name` | a short string identifying the domain the puzzle was scraped from |
+| `puzzle-no` | the puzzle number from the domain |
 | `difficulty` | the difficulty of the puzzle, mapped to a human-readable word, e.g. `easy`, `medium`, `hard` |
-| `puzzle-id` | a unique identifier for the puzzle for the domain |
 | `date` | the date at which the puzzle was scraped |
 | `url` | the URL of the original puzzle page |
-| `width` | the width of the puzzle |
-| `height` | the height of the puzzle |
-| `pzpr-string` | the puzzle in pzpr format (with width and height removed) |
+| `pzpr` | the puzzle in pzpr format, e.g. `11/13/rcjascjazlezlbjdsbjdp` |
