@@ -55,6 +55,7 @@ impl HTMLDownloader<'_> {
     /// Returns an error if the URL cannot be fetched, if the status code is not success,
     /// or if the domain cannot be parsed.
     pub(crate) async fn download(&self, url: &str) -> Result<String, String> {
+        eprintln!("[{}] Downloading '{url}'...", chrono::Local::now().format("%Y-%m-%d %H:%M:%S"));
         let domain = Self::extract_domain(url)?;
 
         // Rate limiting: ensure 10 seconds between requests per domain
@@ -65,6 +66,10 @@ impl HTMLDownloader<'_> {
                 if elapsed < Duration::from_secs(10) {
                     let wait_time = Duration::from_secs(10) - elapsed;
                     drop(times); // Release the lock before sleeping
+                    eprintln!(
+                        "Waiting for {} seconds before making request to domain '{domain}' to respect rate limits...",
+                        wait_time.as_secs()
+                    );
                     tokio::time::sleep(wait_time).await;
                     times = self.request_times.lock().await;
                 }

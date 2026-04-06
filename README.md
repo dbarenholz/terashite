@@ -27,8 +27,9 @@ When trying to read a config file, we look for `terashite.conf` in the XDG confi
 A config file is exceedingly simple, and looks like this:
 
 ```toml
-# This is a comment that will be ignored.
-out = "/path/to/save/puzzles"
+# Path to save puzzles will be created on first run if it doesn't exist.
+# Don't add quotes, we split on `=`, trim whitespace, and then take the rest verbatim as the path.
+out = /path/to/save/puzzles
 ```
 
 ## Puzzle format

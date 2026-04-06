@@ -10,6 +10,16 @@ use crate::disk;
 use crate::html::HTMLDownloader;
 use crate::model;
 
+/// A "wrapper" around a Result so we can also encode the case where a puzzle is already saved.
+pub enum ScrapeResult {
+    /// The puzzle is already saved at the given path.
+    IsSavedAt(String),
+    // Fetching puzzle is Ok
+    Ok(model::Puzzle),
+    /// Fetching puzzle is Err
+    Err(String),
+}
+
 /// A trait for scraping akari puzzles from a variety of sources.
 /// Certain sources will be paginated, others use javascript.
 ///
@@ -38,21 +48,21 @@ pub trait Scraper: Send + Sync {
         &self,
         downloader: &HTMLDownloader,
         cfg: &disk::Cfg,
-    ) -> Result<Vec<model::Puzzle>, String>;
+    ) -> Result<Vec<ScrapeResult>, String>;
 }
 
 /// A trait for scraping single akari puzzles.
 /// This is only used when we can't otherwise easily extract puzzles from a paginated archive, or when explicitly requested from CLI arguments.
 #[async_trait]
 pub trait SinglePuzzleScraper: Scraper {
-    /// CSS selector for difficulty element to be used in `get_difficulty`.
-    fn difficulty_selector(&self) -> &'static str;
+    /// CSS selectors for difficulty element to be used in `get_difficulty`.
+    fn difficulty_selector(&self) -> Vec<&'static str>;
 
-    /// CSS selector for pzpr element to be used in `get_pzpr`.
-    fn pzpr_selector(&self) -> &'static str;
+    /// CSS selectors for pzpr element to be used in `get_pzpr`.
+    fn pzpr_selector(&self) -> Vec<&'static str>;
 
-    /// CSS selector for puzzle number element to be used in `get_puzzle_no`.
-    fn puzzle_no_selector(&self) -> &'static str;
+    /// CSS selectors for puzzle number element to be used in `get_puzzle_no`.
+    fn puzzle_no_selector(&self) -> Vec<&'static str>;
 
     /// Gets the difficulty of a puzzle from the document.
     ///
@@ -80,40 +90,54 @@ pub trait SinglePuzzleScraper: Scraper {
         &self,
         url: &str,
         downloader: &HTMLDownloader<'_>,
-    ) -> Result<model::Puzzle, String> {
-        let document = self.download(downloader, url).await?;
+        cfg: &disk::Cfg,
+    ) -> ScrapeResult {
+        if let Some(path) = cfg.cache.get(url) {
+            return ScrapeResult::IsSavedAt(path.to_string());
+        }
 
-        let difficulty = self.get_difficulty(&document)?;
-        let pzpr = self.get_pzpr(&document)?;
-        let number = self.get_puzzle_no(&document)?;
+        let get = async |url| {
+            let document = self.download(downloader, url).await?;
+            let difficulty = self.get_difficulty(&document)?;
+            let pzpr = self.get_pzpr(&document)?;
+            let number = self.get_puzzle_no(&document)?;
+            let domain_name = self.name().to_string();
 
-        let domain_name = self.name().to_string();
+            Ok(model::Puzzle {
+                domain_name,
+                difficulty,
+                number,
+                at: chrono::Utc::now(),
+                from_url: url.to_string(),
+                pzpr,
+            })
+        };
 
-        Ok(model::Puzzle {
-            domain_name,
-            difficulty,
-            number,
-            at: chrono::Utc::now(),
-            from_url: url.to_string(),
-            pzpr,
-        })
+        match get(url).await {
+            Ok(puzzle) => ScrapeResult::Ok(puzzle),
+            Err(e) => ScrapeResult::Err(e),
+        }
     }
 }
 
 // A trait for scraping akari puzzles from paginated archives
 #[async_trait]
 pub trait PaginatedScraper: Scraper {
-    /// CSS selector for puzzle entry element to be used in `get_entries`.
-    fn entry_selector(&self) -> &'static str;
+    /// CSS selectors for puzzle entry element to be used in `get_entries`.
+    fn entry_selector(&self) -> Vec<&'static str>;
 
-    /// CSS selector for difficulty element within an entry to be used in `get_entry_difficulty`.
-    fn entry_difficulty_selector(&self) -> &'static str;
+    /// CSS selectors for difficulty element within an entry to be used in `get_entry_difficulty`.
+    fn entry_difficulty_selector(&self) -> Vec<&'static str>;
 
-    /// CSS selector for pzpr element within an entry to be used in `get_entry_pzpr`.
-    fn entry_pzpr_selector(&self) -> &'static str;
+    /// CSS selectors for pzpr element within an entry to be used in `get_entry_pzpr`.
+    fn entry_pzpr_selector(&self) -> Vec<&'static str>;
 
-    /// CSS selector for puzzle number element within an entry to be used in `get_entry_puzzle_no`.
-    fn entry_puzzle_no_selector(&self) -> &'static str;
+    /// CSS selectors for puzzle number element within an entry to be used in `get_entry_puzzle_no`.
+    fn entry_puzzle_no_selector(&self) -> Vec<&'static str>;
+
+    /// CSS selectors for URL of puzzle, so we can save it to cache and check if we already have it.
+    /// To be used in `get_entry_as_url`.
+    fn entry_as_url_selector(&self) -> Vec<&'static str>;
 
     /// Gets the difficulty of a puzzle from an entry element.
     ///
@@ -133,8 +157,22 @@ pub trait PaginatedScraper: Scraper {
     /// Returns an error if the puzzle number element cannot be found within the entry, or if the puzzle number cannot be parsed from the element.  
     fn get_entry_puzzle_no(&self, entry_el: ElementRef) -> Result<String, String>;
 
-    /// CSS selector for the "next page" element to be used in `get_next_page_url`.
-    fn next_page_selector(&self) -> &'static str;
+    /// Gets the url of a puzzle from an entry element.
+    ///
+    /// # Errors
+    /// Returns an error if the url element cannot be found within the entry, or if the url cannot be extracted from the element.
+    fn get_entry_as_url(&self, entry_el: ElementRef) -> Result<String, String> {
+        first_attr_required(
+            &entry_el,
+            self.entry_as_url_selector().as_slice(),
+            "href",
+            "entry_as_url",
+        )
+        .map(ToOwned::to_owned)
+    }
+
+    /// CSS selectors for the "next page" element to be used in `get_next_page_url`.
+    fn next_page_selector(&self) -> Vec<&'static str>;
 
     /// The URL of the first page of the archive.
     fn first_url(&self) -> &'static str;
@@ -144,7 +182,12 @@ pub trait PaginatedScraper: Scraper {
     /// # Errors
     /// Returns an error if the next page element cannot be found, if the next page URL cannot be extracted from the element, or if the selector is invalid.
     fn get_next_page_url<'a>(&self, html: &'a Html) -> Result<Option<&'a str>, String> {
-        first_attr(html, self.next_page_selector(), "href", "next_page")
+        first_attr(
+            html,
+            self.next_page_selector().as_slice(),
+            "href",
+            "next_page",
+        )
     }
 
     /// Get all entries from a page given the document of the page.
@@ -152,8 +195,15 @@ pub trait PaginatedScraper: Scraper {
     /// # Errors
     /// Returns an error if the entry elements cannot be found, or if the selector is invalid.
     fn get_entries<'a>(&self, document: &'a Html) -> Result<Vec<ElementRef<'a>>, String> {
-        let selector = parse_selector(self.entry_selector(), "entry")?;
-        Ok(document.select(&selector).collect())
+        try_selectors(self.entry_selector().as_slice(), "entry", |selector| {
+            let selector = parse_selector(selector, "entry")?;
+            let entries = document.select(&selector).collect::<Vec<_>>();
+            if entries.is_empty() {
+                Err("no entry elements matched selector".to_string())
+            } else {
+                Ok(entries)
+            }
+        })
     }
 
     /// Fetches all puzzles from the paginated archive.
@@ -164,19 +214,23 @@ pub trait PaginatedScraper: Scraper {
         &self,
         downloader: &HTMLDownloader,
         cfg: &disk::Cfg,
-    ) -> Result<Vec<model::Puzzle>, String> {
+    ) -> Result<Vec<ScrapeResult>, String> {
         let mut results = Vec::new();
         let mut current = self.first_url().to_owned();
-        loop {
+        'outer: loop {
             let document = self.download(downloader, &current).await?;
             let next_page_url = self.get_next_page_url(&document)?.map(ToOwned::to_owned);
-            let this_page_puzzles = self.extract_puzzles_from_page(&current, &document)?;
+            let this_page_puzzles = self.extract_puzzles_from_page(&document, cfg)?;
 
-            for puzzle in this_page_puzzles {
-                if disk::is_already_saved(&puzzle, cfg) {
-                    break;
+            for scrape_result in this_page_puzzles {
+                if let ScrapeResult::IsSavedAt(path) = &scrape_result {
+                    eprintln!(
+                        "Some puzzle from '{current}' is already saved: '{path}'. Stopping pagination."
+                    );
+                    break 'outer;
                 }
-                results.push(puzzle);
+
+                results.push(scrape_result);
             }
 
             match next_page_url {
@@ -194,31 +248,49 @@ pub trait PaginatedScraper: Scraper {
     /// Returns an error if any of the puzzles cannot be extracted from the page.
     fn extract_puzzles_from_page(
         &self,
-        url: &str,
         document: &Html,
-    ) -> Result<Vec<model::Puzzle>, String> {
-        self.get_entries(document)?
+        cfg: &disk::Cfg,
+    ) -> Result<Vec<ScrapeResult>, String> {
+        let entries = self.get_entries(document)?;
+        Ok(entries
             .into_iter()
             .map(|entry_el| {
-                let difficulty = self.get_entry_difficulty(entry_el)?;
-                let pzpr = self.get_entry_pzpr(entry_el)?;
-                let number = self.get_entry_puzzle_no(entry_el)?;
+                let entry_url = match self.get_entry_as_url(entry_el) {
+                    Ok(url) => url,
+                    Err(e) => return ScrapeResult::Err(format!("cannot get entry url: {e}")),
+                };
 
-                let domain_name = self.name().to_string();
+                if let Some(path) = cfg.cache.get(&entry_url) {
+                    return ScrapeResult::IsSavedAt(path.to_string());
+                }
 
-                Ok(model::Puzzle {
-                    domain_name,
-                    difficulty,
-                    number,
-                    at: chrono::Utc::now(),
-                    from_url: url.to_string(),
-                    pzpr,
-                })
+                let get = |entry_el| {
+                    let difficulty = self.get_entry_difficulty(entry_el)?;
+                    let pzpr = self.get_entry_pzpr(entry_el)?;
+                    let number = self.get_entry_puzzle_no(entry_el)?;
+
+                    let domain_name = self.name().to_string();
+
+                    Ok(model::Puzzle {
+                        domain_name,
+                        difficulty,
+                        number,
+                        at: chrono::Utc::now(),
+                        from_url: entry_url.to_string(),
+                        pzpr,
+                    })
+                };
+
+                match get(entry_el) {
+                    Ok(puzzle) => ScrapeResult::Ok(puzzle),
+                    Err(e) => ScrapeResult::Err(e),
+                }
             })
-            .collect()
+            .collect())
     }
 }
 
+// NOTE: This must always be sorted alphabetically by name.
 /// A static map of scraper names to their base URLs and puzzle URL formats.
 ///
 /// The map is sorted by name, so that we can use binary search to access it.
@@ -230,17 +302,17 @@ pub trait PaginatedScraper: Scraper {
 /// The `puzzle_url` is mostly used to communicate valid puzzle URLs to the user. We hijack it in implementation for easy extraction to the puzzle number.
 pub static SCRAPER_INFO: &[(&str, (&str, &str))] = &[
     (
-        tibisukemaru::ID,
-        (
-            "http://tibisukemaru.blog.fc2.com/",
-            "http://tibisukemaru.blog.fc2.com/blog-entry-{{puzzle_no}}.html",
-        ),
-    ),
-    (
         bachelor_seal::ID,
         (
             "http://blog.livedoor.jp/bachelor_seal-puzzle/",
             "http://blog.livedoor.jp/bachelor_seal-puzzle/archives/{{puzzle_no}}.html",
+        ),
+    ),
+    (
+        tibisukemaru::ID,
+        (
+            "http://tibisukemaru.blog.fc2.com/",
+            "http://tibisukemaru.blog.fc2.com/blog-entry-{{puzzle_no}}.html",
         ),
     ),
 ];
@@ -248,6 +320,7 @@ pub static SCRAPER_INFO: &[(&str, (&str, &str))] = &[
 /// Gets the base URL and puzzle URL format for a scraper by its name.
 #[must_use]
 pub fn info_for_name(name: &str) -> Option<(&'static str, &'static str)> {
+    // eprintln!("Getting scraper info for domain '{name}'...");
     SCRAPER_INFO
         .binary_search_by(|(k, _)| k.cmp(&name))
         .ok()
@@ -277,6 +350,7 @@ pub fn base_urls() -> Vec<&'static str> {
 /// Returns `None` if no scraper with the given name exists.
 #[must_use]
 pub fn puzzle_url_for(domain: &str) -> Option<&'static str> {
+    // eprintln!("Getting puzzle url format for domain '{domain}'...");
     let (_, puzzle_url) = info_for_name(domain)?;
     Some(puzzle_url)
 }
@@ -354,63 +428,141 @@ fn parse_selector(selector: &str, label: &str) -> Result<Selector, String> {
     Selector::parse(selector).map_err(|e| format!("cannot create selector for {label}: {e}"))
 }
 
+fn try_selectors<T, F>(selectors: &[&str], label: &str, mut attempt: F) -> Result<T, String>
+where
+    F: FnMut(&str) -> Result<T, String>,
+{
+    if selectors.is_empty() {
+        return Err(format!("no selectors configured for {label}"));
+    }
+
+    let mut errors = Vec::new();
+    for selector in selectors {
+        match attempt(selector) {
+            Ok(value) => return Ok(value),
+            Err(error) => errors.push(format!("'{selector}': {error}")),
+        }
+    }
+
+    Err(format!(
+        "cannot get {label} with configured selectors: {}",
+        errors.join("; ")
+    ))
+}
+
 /// Gets the first attribute of the first element matching a selector, if it exists.
 fn first_attr<'a, S: Selectable>(
     selectable: &'a S,
-    selector: &str,
+    selectors: &[&str],
     attr: &str,
     label: &str,
 ) -> Result<Option<&'a str>, String> {
-    let selector = parse_selector(selector, label)?;
-    Ok(selectable
-        .get(&selector)?
-        .next()
-        .and_then(|el| el.value().attr(attr)))
+    for selector in selectors {
+        let selector = parse_selector(selector, label)?;
+        if let Some(value) = selectable
+            .get(&selector)?
+            .next()
+            .and_then(|el| el.value().attr(attr))
+        {
+            return Ok(Some(value));
+        }
+    }
+
+    Ok(None)
 }
 
 /// Gets the first attribute of the first element matching a selector, if it exists. Returns an error if the element doesn't exist.
 fn first_attr_required<'a, S: Selectable>(
     selectable: &'a S,
-    selector: &str,
+    selectors: &[&str],
     attr: &str,
     label: &str,
-) -> Result<Option<&'a str>, String> {
-    let selector = parse_selector(selector, label)?;
-    let element = selectable
-        .get(&selector)?
-        .next()
-        .ok_or_else(|| format!("cannot find {label} element"))?;
-    Ok(element.value().attr(attr))
+) -> Result<&'a str, String> {
+    try_selectors(selectors, label, |selector| {
+        let selector = parse_selector(selector, label)?;
+        let element = selectable
+            .get(&selector)?
+            .next()
+            .ok_or_else(|| format!("cannot find {label} element"))?;
+
+        element
+            .value()
+            .attr(attr)
+            .ok_or_else(|| format!("{label} element found but does not have {attr} attribute"))
+    })
 }
 
-/// Extract the pzpr URL from the HTML of a puzzle entry, and convert it to a `PzprStr`.
-///
-/// # Errors
-/// Returns an error if the pzpr URL cannot be extracted, if the selector is invalid, if the pzpr URL does not have the expected format, or if the pzpr string cannot be parsed.
-pub(crate) fn pzpr_from_selectable<S: Selectable>(
+fn inner_html_required<S: Selectable>(
     selectable: &S,
-    selector: &str,
+    selectors: &[&str],
+    label: &str,
 ) -> Result<String, String> {
+    try_selectors(selectors, label, |selector| {
+        let selector = parse_selector(selector, label)?;
+        let element = selectable
+            .get(&selector)?
+            .next()
+            .ok_or_else(|| format!("cannot find {label} element"))?;
+
+        Ok(element.inner_html())
+    })
+}
+
+fn text_required<S: Selectable>(
+    selectable: &S,
+    selectors: &[&str],
+    label: &str,
+) -> Result<String, String> {
+    try_selectors(selectors, label, |selector| {
+        let selector = parse_selector(selector, label)?;
+        let element = selectable
+            .get(&selector)?
+            .next()
+            .ok_or_else(|| format!("cannot find {label} element"))?;
+
+        Ok(element.text().collect::<String>())
+    })
+}
+
+pub(crate) fn pzpr_from_url(url: &str) -> Result<String, String> {
     let possible_prefixes = [
-        // tibisukemaru and bachelor seal use pzv.jp
         "http://pzv.jp/p.html?lightup/",
         "https://pzv.jp/p.html?lightup/",
-        // daily akari uses puzz.link
+        "http://pzv.jp/p.html?akari/",
+        "https://pzv.jp/p.html?akari/",
+        "http://puzz.link/p?lightup/",
+        "https://puzz.link/p?lightup/",
         "http://puzz.link/p?akari/",
         "https://puzz.link/p?akari/",
+        "http://puzz.link/p.html?lightup/",
+        "https://puzz.link/p.html?lightup/",
+        "http://puzz.link/p.html?akari/",
+        "https://puzz.link/p.html?akari/",
     ];
-
-    let pzpr_url =
-        first_attr_required(selectable, selector, "href", "pzpr")?.ok_or("cannot find pzpr url")?;
 
     let pzpr_prefix = possible_prefixes
         .iter()
-        .find(|prefix| pzpr_url.starts_with(*prefix))
-        .ok_or_else(|| format!("pzpr url '{pzpr_url}' does not start with any expected prefix"))?;
+        .find(|prefix| url.starts_with(*prefix))
+        .ok_or_else(|| format!("pzpr url '{url}' does not start with any expected prefix"))?;
 
-    let stripped = pzpr_url.strip_prefix(pzpr_prefix).ok_or_else(|| {
-        format!("cannot strip expected prefix '{pzpr_prefix}' from pzpr url '{pzpr_url}'")
+    let stripped = url.strip_prefix(pzpr_prefix).ok_or_else(|| {
+        format!("cannot strip expected prefix '{pzpr_prefix}' from pzpr url '{url}'")
     })?;
 
     Ok(stripped.to_string())
+}
+
+/// Extract the pzpr URL from the HTML of a puzzle entry, and convert it to a `PzprStr`.
+/// Optionally, just provide the URL directly.
+///
+/// # Errors
+/// Returns an error if the pzpr URL cannot be extracted, if the selector is invalid, if the pzpr URL does not have the expected format, or if the pzpr string cannot be parsed.
+pub(crate) fn pzpr_from_el<S: Selectable>(
+    selectable: &S,
+    selectors: &[&str],
+) -> Result<String, String> {
+    try_selectors(selectors, "pzpr", |selector| {
+        let pzpr_url = first_attr_required(selectable, &[selector], "href", "pzpr")?;
+        pzpr_from_url(pzpr_url)
+    })
 }

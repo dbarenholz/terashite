@@ -5,6 +5,7 @@ use terashite::disk;
 use terashite::html;
 use terashite::scraper;
 
+// TODO: Really this should be a bunch of subcommands, but then -s and -d should be smart enough to get multiple domains/puzzles
 /// CLI arguments.
 ///
 #[derive(Debug, Parser)]
@@ -18,20 +19,19 @@ use terashite::scraper;
 )]
 struct Args {
     /// List identifiers and example puzzle urls for all implemented scrapers.
-    ///
-    /// Domain identifiers can be used with --domain to run for a particular domain.
-    /// Puzzle urls, with the shape as the example, can be used with --single.
-    #[arg(long = "list-domains", short = 'l', conflicts_with_all = ["domains", "singles"])]
+    #[arg(long = "list-domains", short = 'l', conflicts_with_all = ["domains", "singles", "dump_config"])]
     list_domains: bool,
 
-    /// Run scrapers for passed domains. Can be specified multiple times.
-    /// To see valid domain identifiers, use --list-domains.
-    #[arg(long = "domain", short = 'd', conflicts_with_all = ["list_domains", "singles"])]
+    /// Dump the used config to stdout and exit.
+    #[arg(long="dump-config", short='c', conflicts_with_all = ["list_domains", "domains", "singles"])]
+    dump_config: bool,
+
+    /// Run scrapers for passed domains.
+    #[arg(long = "domain", short = 'd', conflicts_with_all = ["list_domains", "singles", "dump_config"])]
     domains: Vec<String>,
 
-    /// Only scrape a singular puzzle from a particular url. Can be specified multiple times.
-    /// Will only work if we have a scraper for the domain of the url.
-    #[arg(long = "single", short = 's', conflicts_with_all = ["domains", "list_domains"])]
+    /// Only scrape a singular puzzle from a particular url.
+    #[arg(long = "single", short = 's', conflicts_with_all = ["domains", "list_domains", "dump_config"])]
     singles: Vec<String>,
 }
 
@@ -45,25 +45,44 @@ async fn main() {
         return;
     }
 
-    let cfg = disk::get_config();
+    if args.dump_config {
+        let cfg = disk::get_config();
+        println!("{cfg}");
+        return;
+    }
+
+    let mut cfg = disk::get_config();
+    disk::ensure_outs(&cfg).unwrap_or_else(|e| {
+        eprintln!("Could not ensure output directories exist: {e}");
+        std::process::exit(1);
+    });
     let client = html::create_client();
     let downloader = html::create_downloader(&client);
 
-    if !args.domains.is_empty() {
-        scrape_domains(args.domains, &downloader, &cfg).await;
-        return;
-    }
-
+    // TODO: it should probably be refactored so that we can do scraper::puzzles() and scraper::domains()
+    // NOTE: this block will modify cfg.cache
     if !args.singles.is_empty() {
-        scrape_puzzles(args.singles, &downloader, &cfg).await;
-        return;
+        scrape_puzzles(args.singles, &downloader, &mut cfg).await;
+    } else if !args.domains.is_empty() {
+        scrape_domains(args.domains, &downloader, &mut cfg).await;
+    } else {
+        scrape_domains(scraper::names(), &downloader, &mut cfg).await;
     }
 
-    // no arguments, so we scrape all domains
-    scrape_domains(scraper::names(), &downloader, &cfg).await;
+    // Always write cache back to disk
+    disk::write_cache(&cfg).unwrap_or_else(|e| {
+            eprintln!("Error writing cache to disk: {e}");
+            eprintln!("Here's the full cache that we tried to write: {:#?}", cfg.cache);
+            eprintln!("We suggest either fixing file permissions, or manually writing the cache at the expected path.");
+            std::process::exit(1);
+        });
 }
 
-async fn scrape_puzzles(urls: Vec<String>, downloader: &html::HTMLDownloader<'_>, cfg: &disk::Cfg) {
+async fn scrape_puzzles(
+    urls: Vec<String>,
+    downloader: &html::HTMLDownloader<'_>,
+    cfg: &mut disk::Cfg,
+) {
     // map url to domain id or "invalid" if no domain matches
     let mut validity_mp: HashMap<String, Vec<String>> = HashMap::new();
 
@@ -85,7 +104,6 @@ async fn scrape_puzzles(urls: Vec<String>, downloader: &html::HTMLDownloader<'_>
             .or_insert_with(|| vec![url.clone()]);
     }
 
-
     if validity_mp.contains_key("invalid") {
         let invalids = validity_mp.get("invalid").unwrap();
         eprint!("There was at least one invalid puzzle url. ");
@@ -104,12 +122,15 @@ async fn scrape_puzzles(urls: Vec<String>, downloader: &html::HTMLDownloader<'_>
         for url in urls {
             eprintln!("Scraping puzzle url '{url}' with scraper '{domain}'...");
 
-            match scraper.fetch_single(&url, downloader).await {
-                Ok(res) => match disk::save_puzzle(&res, cfg) {
-                    Ok(saved_at) => eprintln!("Saved puzzle at '{url}' to '{saved_at}'."),
+            match scraper.fetch_single(&url, downloader, cfg).await {
+                scraper::ScrapeResult::IsSavedAt(path) => {
+                    eprintln!("Puzzle from url '{url}' is already saved at '{path}'.");
+                }
+                scraper::ScrapeResult::Ok(puzzle) => match disk::save_puzzle(&puzzle, cfg) {
+                    Ok(saved_at) => eprintln!("Saved puzzle from '{url}' to '{saved_at}'."),
                     Err(e) => eprintln!("Error saving puzzle from url '{url}': {e}"),
                 },
-                Err(e) => {
+                scraper::ScrapeResult::Err(e) => {
                     eprintln!("Error scraping puzzle url '{url}': {e}");
                 }
             }
@@ -120,7 +141,7 @@ async fn scrape_puzzles(urls: Vec<String>, downloader: &html::HTMLDownloader<'_>
 async fn scrape_domains<T: AsRef<str>>(
     domain_ids: Vec<T>,
     downloader: &html::HTMLDownloader<'_>,
-    cfg: &disk::Cfg,
+    cfg: &mut disk::Cfg,
 ) {
     let scraper_ids = scraper::names();
     let (invalids, valids) = domain_ids
@@ -133,7 +154,8 @@ async fn scrape_domains<T: AsRef<str>>(
         eprint!("If invalid domains are included, we don't do any work. ");
         eprintln!("Please fix the invalid domains and try again.");
         eprintln!("Invalid domains: {}", invalids.join(", "));
-        eprintln!("Valid domains: {}", valids.join(", "));
+        eprintln!("Valid domains (your input): {}", valids.join(", "));
+        eprintln!("Valid domains (implemented): {}", scraper_ids.join(", "));
         return;
     }
 
@@ -146,18 +168,26 @@ async fn scrape_domains<T: AsRef<str>>(
 
     for domain in valids {
         let scraper = scraper::for_name(domain).unwrap();
+
+        // TODO: This architecture forces us to first scrape ALL puzzles, and then save them.
+        // It would be a lot nicer to save each puzzle immediately, so we don't "lose" correct results on failure
         eprintln!("Scraping domain '{domain}'...");
         match scraper.fetch_puzzles(downloader, cfg).await {
-            Ok(puzzles) => {
-                eprintln!(
-                    "Successfully scraped domain '{domain}'. Scraped {} puzzles.",
-                    puzzles.len()
-                );
-
-                for puzzle in &puzzles {
-                    match disk::save_puzzle(puzzle, cfg) {
-                        Ok(path) => eprintln!("Saved puzzle from domain '{domain}' to '{path}'."),
-                        Err(e) => eprintln!("Error saving puzzle from domain '{domain}': {e}"),
+            Ok(results) => {
+                for result in &results {
+                    match result {
+                        scraper::ScrapeResult::IsSavedAt(_) => {
+                            eprintln!("Puzzle from domain '{domain}' is already saved. Skipping.");
+                        }
+                        scraper::ScrapeResult::Ok(puzzle) => match disk::save_puzzle(puzzle, cfg) {
+                            Ok(path) => {
+                                eprintln!("Saved puzzle from domain '{domain}' to '{path}'.")
+                            }
+                            Err(e) => eprintln!("Error saving puzzle from domain '{domain}': {e}"),
+                        },
+                        scraper::ScrapeResult::Err(e) => {
+                            eprintln!("Error scraping puzzle from domain '{domain}': {e}");
+                        }
                     }
                 }
             }

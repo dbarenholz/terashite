@@ -6,7 +6,6 @@ use crate::disk;
 use crate::html;
 use crate::model;
 use crate::scraper;
-use crate::scraper::SinglePuzzleScraper;
 
 pub(crate) static ID: &str = "tibisukemaru";
 
@@ -22,7 +21,7 @@ impl super::Scraper for TibisukemaruScraper {
         &self,
         downloader: &html::HTMLDownloader,
         cfg: &disk::Cfg,
-    ) -> Result<Vec<model::Puzzle>, String> {
+    ) -> Result<Vec<super::ScrapeResult>, String> {
         super::PaginatedScraper::fetch_puzzles(self, downloader, cfg).await
     }
 }
@@ -37,8 +36,8 @@ impl TibisukemaruScraper {
         model::Difficulty::from_str(difficulty_str)
     }
 
-    fn puzzle_no_from_inner_html(inner_html: &str) -> Result<String, String> {
-        let puzzle_no = inner_html
+    fn puzzle_no_from_text(text: &str) -> Result<String, String> {
+        let puzzle_no = text
             .chars()
             .filter(char::is_ascii_digit)
             .collect::<String>();
@@ -53,16 +52,16 @@ impl TibisukemaruScraper {
 
 #[async_trait]
 impl super::SinglePuzzleScraper for TibisukemaruScraper {
-    fn difficulty_selector(&self) -> &'static str {
-        "head > title"
+    fn difficulty_selector(&self) -> Vec<&'static str> {
+        vec!["head > title"]
     }
 
-    fn pzpr_selector(&self) -> &'static str {
-        "body > a[title=☆ぱずぷれへ☆]"
+    fn pzpr_selector(&self) -> Vec<&'static str> {
+        vec!["a[title='☆ぱずぷれへ☆']"]
     }
 
     // This happens to be the same as the difficulty selector, so we can just reuse that.
-    fn puzzle_no_selector(&self) -> &'static str {
+    fn puzzle_no_selector(&self) -> Vec<&'static str> {
         self.difficulty_selector()
     }
 
@@ -75,13 +74,11 @@ impl super::SinglePuzzleScraper for TibisukemaruScraper {
     /// # Errors
     /// Returns an error if the difficulty element cannot be found, or if the difficulty cannot be parsed from the title.
     fn get_difficulty(&self, document: &scraper::Html) -> Result<model::Difficulty, String> {
-        let selector = super::parse_selector(self.difficulty_selector(), "difficulty")?;
-        let inner_html = document
-            .select(&selector)
-            .next()
-            .ok_or_else(|| "difficulty element not found".to_string())?
-            .inner_html();
-
+        let inner_html = super::inner_html_required(
+            document,
+            self.difficulty_selector().as_slice(),
+            "difficulty",
+        )?;
         Self::difficulty_from_inner_html(&inner_html)
     }
 
@@ -91,7 +88,8 @@ impl super::SinglePuzzleScraper for TibisukemaruScraper {
     /// # Errors
     /// Returns an error if the pzpr element cannot be found, or if the pzpr string cannot be parsed from the element.
     fn get_pzpr(&self, document: &scraper::Html) -> Result<String, String> {
-        super::pzpr_from_selectable(document, self.pzpr_selector())
+        // calls try_selectors() internally
+        super::pzpr_from_el(document, self.pzpr_selector().as_slice())
     }
 
     /// Gets the puzzle number of a puzzle from the document.
@@ -100,70 +98,81 @@ impl super::SinglePuzzleScraper for TibisukemaruScraper {
     /// # Errors
     /// Returns an error if the puzzle number element cannot be found, or if the puzzle number cannot be parsed from the title.
     fn get_puzzle_no(&self, document: &scraper::Html) -> Result<String, String> {
-        let selector = super::parse_selector(self.puzzle_no_selector(), "puzzle_no")?;
-        let inner_html = document
-            .select(&selector)
-            .next()
-            .ok_or_else(|| "puzzle_no element not found".to_string())?
-            .inner_html();
+        // calls try_selectors() internally
+        let text =
+            super::text_required(document, self.puzzle_no_selector().as_slice(), "puzzle_no")?;
 
-        Self::puzzle_no_from_inner_html(&inner_html)
+        Self::puzzle_no_from_text(&text)
     }
 }
 
 #[async_trait]
 impl super::PaginatedScraper for TibisukemaruScraper {
-    fn next_page_selector(&self) -> &'static str {
-        "div.link >p a:nth-child(2)"
+    fn next_page_selector(&self) -> Vec<&'static str> {
+        vec!["div.link > p a:last-child"]
     }
 
     fn first_url(&self) -> &'static str {
         "http://tibisukemaru.blog.fc2.com/blog-category-14.html"
     }
 
-    fn entry_selector(&self) -> &'static str {
-        "div.entry"
+    /// Tibisukemaru links back to Home on the last page; we don't want to go home.
+    fn get_next_page_url<'a>(&self, html: &'a scraper::Html) -> Result<Option<&'a str>, String> {
+        let url = super::first_attr(
+            html,
+            self.next_page_selector().as_slice(),
+            "href",
+            "next_page",
+        )?;
+        Ok(url.filter(|u| *u != "http://tibisukemaru.blog.fc2.com/"))
     }
 
-    fn entry_difficulty_selector(&self) -> &'static str {
-        "div.tit > h2"
+    fn entry_selector(&self) -> Vec<&'static str> {
+        vec!["div.entry"]
     }
 
-    fn entry_pzpr_selector(&self) -> &'static str {
-        "a[title='☆ぱずぷれへ☆']"
+    fn entry_difficulty_selector(&self) -> Vec<&'static str> {
+        vec!["div.tit > h2"]
     }
 
-    fn entry_puzzle_no_selector(&self) -> &'static str {
-        self.difficulty_selector()
+    fn entry_pzpr_selector(&self) -> Vec<&'static str> {
+        // note: the `*=` is very important due to html changes over time -- with `~=` things break horribly
+        vec!["a[title*='ぱずぷれへ']"]
+    }
+
+    fn entry_puzzle_no_selector(&self) -> Vec<&'static str> {
+        self.entry_difficulty_selector()
+    }
+
+    fn entry_as_url_selector(&self) -> Vec<&'static str> {
+        vec!["div.date > p > a"]
     }
 
     fn get_entry_pzpr(&self, entry_el: scraper::ElementRef) -> Result<String, String> {
-        super::pzpr_from_selectable(&entry_el, self.entry_pzpr_selector())
+        // calls try_selectors() internally
+        super::pzpr_from_el(&entry_el, self.entry_pzpr_selector().as_slice())
     }
 
     fn get_entry_difficulty(
         &self,
         entry_el: scraper::ElementRef,
     ) -> Result<model::Difficulty, String> {
-        let selector = super::parse_selector(self.entry_difficulty_selector(), "difficulty")?;
-        let inner_html = entry_el
-            .select(&selector)
-            .next()
-            .ok_or_else(|| "difficulty element not found".to_string())?
-            .inner_html();
-
-        Self::difficulty_from_inner_html(&inner_html)
+        let res = super::inner_html_required(
+            &entry_el,
+            self.entry_difficulty_selector().as_slice(),
+            "difficulty",
+        )?;
+        Self::difficulty_from_inner_html(&res)
     }
 
     fn get_entry_puzzle_no(&self, entry_el: scraper::ElementRef) -> Result<String, String> {
-        // same as difficulty, just keep digits
-        let selector = super::parse_selector(self.entry_puzzle_no_selector(), "puzzle_no")?;
-        let inner_html = entry_el
-            .select(&selector)
-            .next()
-            .ok_or_else(|| "puzzle_no element not found".to_string())?
-            .inner_html();
+        // calls try_selectors() internally
+        let text = super::text_required(
+            &entry_el,
+            self.entry_puzzle_no_selector().as_slice(),
+            "puzzle_no",
+        )?;
 
-        Self::puzzle_no_from_inner_html(&inner_html)
+        Self::puzzle_no_from_text(&text)
     }
 }

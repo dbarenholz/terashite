@@ -27,7 +27,8 @@ impl Display for Difficulty {
 impl FromStr for Difficulty {
     type Err = String;
 
-    // NOTE: we want to match same arms as we split this up by domain.
+    // This clippy allow makes sense here, because we want to be explicit about the mapping on a domain level.
+    // Clearly, each domain can map to "Hard" or "Easy" or whatever, so match_same_arms is not a problem here.
     #[allow(clippy::match_same_arms)]
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
@@ -41,13 +42,7 @@ impl FromStr for Difficulty {
             "☆☆☆" => Ok(Self::Medium),
             "☆☆☆☆" => Ok(Self::Hard),
             "☆☆☆☆☆" => Ok(Self::VeryHard),
-
-            // "very-easy" => Ok(Self::VeryEasy),
-            // "easy" => Ok(Self::Easy),
-            // "medium" => Ok(Self::Medium),
-            // "hard" => Ok(Self::Hard),
-            // "very-hard" => Ok(Self::VeryHard),
-            // "unknown" => Ok(Self::Unknown),
+            // fallthrough
             _ => Err(format!("invalid difficulty string: {s}")),
         }
     }
@@ -100,7 +95,7 @@ impl Puzzle {
     /// Gets the content that should be saved for this puzzle.
     pub(crate) fn content(&self) -> String {
         format!(
-            "domain_name: {}\ndifficulty: {}\npuzzle_no: {}\nat: {}\nfrom_url: {}\n{}",
+            "# domain_name: {}\n# difficulty: {}\n# puzzle_no: {}\n# at: {}\n# from_url: {}\n{}",
             self.domain_name,
             self.difficulty,
             self.number,
