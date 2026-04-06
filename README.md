@@ -5,7 +5,11 @@ It could relatively trivially be extended to scrape any puzzle type from the imp
 
 ## Domains
 
-We have scrapers for the [bachelor_seal](http://blog.livedoor.jp/bachelor_seal-puzzle/archives/cat_531435.html) akari archive and the [tibisukemaru](http://tibisukemaru.blog.fc2.com/blog-category-14.html) akari archive. More can be added in the future.
+These are implemented to some extent:
+| domain | status|
+| - | - |
+| [bachelor_seal](http://blog.livedoor.jp/bachelor_seal-puzzle/archives/cat_531435.html)  | at time of writing scrapes 358/373 puzzles, which is 96% of them; works for the most recent ones, so assumption is it'll keep working for a while |
+| [tibisukemaru](http://tibisukemaru.blog.fc2.com/blog-category-14.html) | at time of writing scrapes all puzzles correctly |
 
 ## Usage
 
@@ -26,7 +30,7 @@ When trying to read a config file, we look for `terashite.conf` in the XDG confi
 
 A config file is exceedingly simple, and looks like this:
 
-```toml
+```raw
 # Path to save puzzles will be created on first run if it doesn't exist.
 # Don't add quotes, we split on `=`, trim whitespace, and then take the rest verbatim as the path.
 out = /path/to/save/puzzles
